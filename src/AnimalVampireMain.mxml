@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="utf-8"?>
+<s:WindowedApplication xmlns:fx="http://ns.adobe.com/mxml/2009"
+					   xmlns:s="library://ns.adobe.com/flex/spark"
+					   xmlns:mx="library://ns.adobe.com/flex/mx"
+					   showStatusBar="false"
+					   width="600" height="100" creationComplete="appHandler(event)">
+	<fx:Style source="Main.css"/>
+	<fx:Declarations>
+		<!-- 将非可视元素（例如服务、值对象）放在此处 -->
+	</fx:Declarations>
+	<fx:Script>
+		<![CDATA[
+			import com.larrio.flow.MultiTaskFlow;
+			
+			import mx.events.FlexEvent;
+			import mx.graphics.codec.PNGEncoder;
+			import mx.messaging.channels.StreamingAMFChannel;
+			
+			private var _provider:Array;
+			private var _map:Object;
+			
+			protected function appHandler(e:FlexEvent):void
+			{
+				var url:String = "http://ctc.appimg.qq.com/mc/data/animal.xml?t=" + Math.random().toFixed(6);
+				var request:URLRequest = new URLRequest(url);
+				request.requestHeaders.push(new URLRequestHeader("Referer", "http://qzone.qq.com"));
+				
+				var loader:URLLoader = new URLLoader();
+				loader.dataFormat = URLLoaderDataFormat.BINARY;
+				loader.addEventListener(Event.COMPLETE, configHandler);
+				loader.load(request);
+				
+				errors.text = "0";
+				sucess.text = "0";
+				progress.label = "";
+				
+				_map = {};
+			}
+			
+			protected function configHandler(e:Event):void
+			{
+				var target:URLLoader = e.currentTarget as URLLoader;
+				target.removeEventListener(e.type, arguments.callee);
+				
+				var config:XML = new XML(target.data);
+				var animals:XMLList = config.animals.animal;
+				
+				_provider = [];
+				
+				var item:String, version:String;
+				for each(var node:XML in animals)
+				{
+					item = "http://appimg.qq.com/mc/module/mc/farm/aswf1/";						
+					
+					version = String(node.@v);					
+					if (version) version = "?v=" + version;
+					
+					_provider.push(item + "a" + node.@id + "_1.swf" + version);
+					_provider.push(item + "a" + node.@id + "_0.swf" + version);					
+				}
+				
+				advanceToValue(0);
+				
+				var task:MultiTaskFlow = new MultiTaskFlow(4, AnimalKernal);
+				
+				task.addEventListener(Event.CHANGE, changeHandler);
+				task.addEventListener(Event.COMPLETE, completeHandler);
+				task.execute(_provider);
+			}
+			
+			private function advanceToValue(value:uint):void
+			{
+				var percent:uint = value / _provider.length * 100 >> 0;
+				progress.label = "PROCESSING:" + percent + "%";
+				
+				progress.setProgress(percent, 100);
+			}
+			
+			protected function completeHandler(e:Event):void
+			{
+				var summary:String = JSON.stringify(_map);
+				var stream:FileStream = new FileStream();
+				stream.open(new File(URL.ROOT.url + "/stats.txt"), FileMode.WRITE);
+				stream.writeMultiByte(summary, "utf-8");
+				stream.close();
+			}
+			
+			protected function changeHandler(e:Event):void
+			{
+				var target:MultiTaskFlow = e.currentTarget as MultiTaskFlow;
+				var kernal:AnimalKernal = target.currentKernel as AnimalKernal;
+				
+				var msg:String;
+				var name:String = kernal.name.split(".").shift();
+				
+				var file:File;
+				if (kernal.result)
+				{
+					msg = processFile(kernal);
+					file = new File(URL.LOG.url + "/" + name  + ".log");
+				}
+				else
+				{
+					msg = kernal.data as String;
+					file = new File(URL.ERRORS.url + "/" + name + ".log");
+				}
+				
+				if (msg)
+				{		
+					msg = kernal.name + "\n" + msg;
+					
+					var stream:FileStream = new FileStream();
+					
+					stream.open(file, FileMode.WRITE);
+					stream.writeMultiByte(msg, "utf-8");
+					stream.close();
+				}
+				
+				errors.text = target.errors.toString();
+				sucess.text = target.success.toString();
+				
+				advanceToValue(target.success + target.errors);
+			}
+			
+			private function processFile(kernal:AnimalKernal):String
+			{				
+				var loader:Loader = kernal.result as Loader;
+				
+				var msg:String = "";
+				var content:MovieClip = loader.content as MovieClip;
+				
+				msg += "status:" + content.numChildren + "\n";					
+								
+				var list:Array = [];
+				
+				var data:Object;
+				var key:String, status:uint;
+				for (var i:int = 0; i < content.numChildren; i++)
+				{
+					var target:MovieClip = content.getChildAt(i) as MovieClip;					
+					list.push("status#" + i + ":" + target.numChildren);					
+					
+					status = target.name.match(/\d+$/)[0];
+					if (status > 6)
+					{
+						status = i + 1;
+						if (kernal.name.match(/^a\d+_1\.swf$/i))
+						{
+							status += 2;
+						}
+						
+						key = "exceptions";
+						if (!_map[key]) _map[key] = [];
+						_map[key].push(kernal.name + "#" + target.name + "#" + status);
+					}
+					
+					for (var j:int = 0; j < target.numChildren; j++)
+					{
+						writeActionToFile(kernal.name, target.getChildAt(j) as MovieClip, status, j + 1);
+					}
+					
+					data = _map;
+					key = "status#" + status;
+					if (!data[key]) data[key] = {};
+					
+					data = data[key];
+					key = "children#" + target.numChildren;
+					if (!data[key]) data[key] = 0;
+					
+					data[key]++;
+				}
+				
+				msg += "\t" + list.join("\n\t");
+				
+				if (msg)
+				{
+					msg += "\n" + collectTreeInfo(content);
+				}
+				
+				return msg;
+			}
+			
+			// 把单个动作写入文件
+			private function writeActionToFile(name:String, target:MovieClip, status:uint, direction:uint):void
+			{				
+				name = name.split("_").shift();						
+				
+				var bounds:Rectangle = new Rectangle();
+				for (var frame:uint = 0; frame < target.numChildren; frame++)
+				{
+					target.gotoAndStop(frame);
+					bounds = target.getBounds(target).union(bounds);
+				}
+				
+				var matrix:Matrix = new Matrix();
+				matrix.translate(-bounds.x, -bounds.y);
+				
+				var data:BitmapData = new BitmapData(bounds.width, bounds.height, true, 0);
+				data.draw(target, matrix, null, null, null,true);
+				
+				var bytes:ByteArray = new PNGEncoder().encode(data);
+				var file:File = new File(URL.FRAMES.url + "/" + name + "/" + status + "_" + direction + ".png");
+				var stream:FileStream = new FileStream();
+				stream.open(file, FileMode.WRITE);
+				stream.writeBytes(bytes);
+				stream.close();
+				
+				bytes.length = 0;				
+			}
+			
+			private function collectTreeInfo(container:DisplayObjectContainer, indent:String = "", depth:uint = 1):String
+			{
+				var result:String = "";
+				
+				var item:DisplayObject;
+				for (var i:int = 0; i < container.numChildren; i++)
+				{
+					item = container.getChildAt(i);	
+					result += indent + item + item.name + "\n";
+					
+					if (item is DisplayObjectContainer && depth < 2)
+					{
+						result += collectTreeInfo(item as DisplayObjectContainer, indent + "    ", depth + 1);
+					}
+				}
+				
+				return result;
+			}			
+			
+		]]>
+	</fx:Script>
+	<mx:ProgressBar id="progress" x="0" y="0" width="600" mode="manual" minimum="0" maximum="100"/>
+	<s:Label x="10" y="64" width="181" height="26" fontSize="22" text="success:"/>
+	<s:Label id="sucess" x="124" y="64" width="181" height="26" fontSize="22" text="99999"/>
+	<s:Label x="343" y="63" color="#FF0000" fontSize="22" text="errors:"/>
+	<s:Label id="errors" x="438" y="63" width="142" color="#FF0000" fontSize="22" text="999"/>
+</s:WindowedApplication>
